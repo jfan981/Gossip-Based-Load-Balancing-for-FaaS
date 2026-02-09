@@ -125,7 +125,16 @@ faas-cli deploy -f stack.yaml
 
 We establish a baseline by flooding Node 1 directly to demonstrate the "Silo Effect."
 
-**Command:**
+**1. Visualizing the Spike (Optional):**
+Open a new terminal, shell into Node 1, and run `htop` to watch the CPU usage.
+```bash
+sudo multipass shell node1
+sudo apt-get update && sudo apt-get install -y htop
+htop
+```
+
+**2. Run the Stress Test:**
+Run this from host machine:
 ```bash
 hey -n 100 -c 20 -d "150000" http://192.168.64.2:8080/function/stress-test
 ```
