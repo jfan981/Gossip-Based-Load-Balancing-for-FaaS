@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
-	"sync"
+	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/memberlist"
@@ -16,44 +18,67 @@ import (
 
 // --- CONFIGURATION ---
 var (
-	TargetURL    string  // The actual OpenFaaS Node URL (e.g., http://192.168.64.2:8080)
-	ProxyPort    int     // The port this proxy listens on (e.g., 8081)
-	GossipPort   int     // The port used for internal gossip (e.g., 7946)
-	FakeLoad     float64 // For demo: Force a specific CPU load
-	
-	// State
-	MyCurrentLoad float64
-	LoadLock      sync.RWMutex // Protects MyCurrentLoad
-	
-	// Gossip Cluster
-	list         *memberlist.Memberlist
-	LocalMeta    NodeMeta
+	TargetURL   string  // The actual OpenFaaS Node URL (e.g., http://192.168.64.2:8080)
+	ProxyPort   int     // The port this proxy listens on (e.g., 8081)
+	GossipPort  int     // The port used for internal gossip (e.g., 7946)
+	FakeLoad    float64 // For demo: force a specific CPU load
+	OffloadAt   float64 // Offload when score >= this threshold
+	AcceptBelow float64 // Only offload to peers below this score
+	MaxInflight int64   // Soft local inflight threshold
+
+	// State (atomics to avoid lock contention on hot path).
+	MyCurrentLoadBits uint64
+	LocalInflight     int64
+
+	// Gossip cluster.
+	list *memberlist.Memberlist
+
+	// Reused HTTP client with pooled keep-alive connections.
+	upstreamTransport = &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		MaxIdleConns:        512,
+		MaxIdleConnsPerHost: 256,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	upstreamClient = &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: upstreamTransport,
+	}
 )
 
-// NodeMeta is the data we whisper to other nodes
+// NodeMeta is the data we whisper to other nodes.
 type NodeMeta struct {
 	ProxyAddress string  `json:"addr"` // How to reach me
-	CPULoad      float64 `json:"load"` // My current health
+	CPULoad      float64 `json:"cpu"`  // CPU usage
+	Inflight     int64   `json:"if"`   // Number of in-flight requests
+	Score        float64 `json:"score"`
 }
 
 func main() {
-	// 1. Parse Command Line Arguments
+	// 1. Parse command-line arguments.
 	flag.StringVar(&TargetURL, "target", "http://localhost:8080", "The real OpenFaaS node URL")
 	flag.IntVar(&ProxyPort, "port", 8081, "HTTP port for this proxy")
 	flag.IntVar(&GossipPort, "gossip", 7946, "Gossip port")
 	flag.Float64Var(&FakeLoad, "fake-load", 0.0, "Force a fake CPU load (0-100)")
-	joinAddr := flag.String("join", "", "Address of a peer to join (e.g., 127.0.0.1)")
+	flag.Float64Var(&OffloadAt, "offload-at", 60.0, "Offload when local score exceeds this value")
+	flag.Float64Var(&AcceptBelow, "accept-below", 55.0, "Only offload to peers with score below this value")
+	flag.Int64Var(&MaxInflight, "max-inflight", 8, "Soft local inflight threshold")
+	joinAddr := flag.String("join", "", "Address of a peer to join (e.g., 127.0.0.1:7947)")
 	flag.Parse()
 
-	// 2. Start the Gossip Protocol
+	if MaxInflight < 1 {
+		MaxInflight = 1
+	}
+
+	// 2. Start the gossip protocol.
 	startGossip(*joinAddr)
 
-	// 3. Start the CPU Monitor (Runs in background)
+	// 3. Start the CPU monitor (runs in background).
 	go monitorCPU()
 
-	// 4. Start the HTTP Proxy Server
+	// 4. Start the HTTP proxy server.
 	http.HandleFunc("/", handleRequest)
-	
+
 	fmt.Printf("--------------------------------------------------\n")
 	fmt.Printf("Proxy Started on Port :%d\n", ProxyPort)
 	fmt.Printf("Forwarding to Target  : %s\n", TargetURL)
@@ -61,19 +86,20 @@ func main() {
 	if FakeLoad > 0 {
 		fmt.Printf("DEMO MODE             : Forcing Load to %.0f%%\n", FakeLoad)
 	}
+	fmt.Printf("Offload Threshold     : %.1f (accept peers < %.1f)\n", OffloadAt, AcceptBelow)
+	fmt.Printf("Max Inflight          : %d\n", MaxInflight)
 	fmt.Printf("--------------------------------------------------\n")
-	
+
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", ProxyPort), nil))
 }
 
 // --- GOSSIP LOGIC ---
 
 func startGossip(joinAddr string) {
-	// Configure Memberlist (Standard LAN config is fine)
 	config := memberlist.DefaultLANConfig()
 	config.BindPort = GossipPort
-	config.Name = fmt.Sprintf("Node-Port-%d", ProxyPort) // Unique Name
-	config.Delegate = &GossipDelegate{} // Hook up our custom data sharing
+	config.Name = fmt.Sprintf("Node-Port-%d", ProxyPort)
+	config.Delegate = &GossipDelegate{}
 
 	var err error
 	list, err = memberlist.Create(config)
@@ -81,7 +107,6 @@ func startGossip(joinAddr string) {
 		panic("Failed to create gossip list: " + err.Error())
 	}
 
-	// If we were told to join an existing cluster, do it now
 	if joinAddr != "" {
 		_, err := list.Join([]string{joinAddr})
 		if err != nil {
@@ -91,135 +116,147 @@ func startGossip(joinAddr string) {
 	}
 }
 
-// GossipDelegate defines what data we share
+// GossipDelegate defines what data we share.
 type GossipDelegate struct{}
 
 func (d *GossipDelegate) NodeMeta(limit int) []byte {
-	// This function is called when we gossip to others.
-	// We send our current load and our address.
-	LoadLock.RLock()
-	defer LoadLock.RUnlock()
-	
+	load := atomicLoadFloat64(&MyCurrentLoadBits)
+	inflight := atomic.LoadInt64(&LocalInflight)
+
 	meta := NodeMeta{
 		ProxyAddress: fmt.Sprintf("http://127.0.0.1:%d", ProxyPort),
-		CPULoad:      MyCurrentLoad,
+		CPULoad:      load,
+		Inflight:     inflight,
+		Score:        localScore(load, inflight),
 	}
 	b, _ := json.Marshal(meta)
 	return b
 }
 
-// Boilerplate methods required by the library (we don't use them)
-func (d *GossipDelegate) NotifyMsg(b []byte) {}
+// Boilerplate methods required by memberlist.
+func (d *GossipDelegate) NotifyMsg(b []byte)                         {}
 func (d *GossipDelegate) GetBroadcasts(overhead, limit int) [][]byte { return nil }
-func (d *GossipDelegate) LocalState(join bool) []byte { return nil }
-func (d *GossipDelegate) MergeRemoteState(buf []byte, join bool) {}
+func (d *GossipDelegate) LocalState(join bool) []byte                { return nil }
+func (d *GossipDelegate) MergeRemoteState(buf []byte, join bool)     {}
 
 // --- CPU MONITORING ---
 
 func monitorCPU() {
 	for {
 		var load float64
-		
+
 		if FakeLoad > 0 {
-			// Demo Mode: Use the fake number
 			load = FakeLoad
 		} else {
-			// Real Mode: Read actual system CPU
 			percent, err := cpu.Percent(0, false)
 			if err == nil && len(percent) > 0 {
 				load = percent[0]
 			}
 		}
 
-		// Update global state
-		LoadLock.Lock()
-		MyCurrentLoad = load
-		LoadLock.Unlock()
+		atomicStoreFloat64(&MyCurrentLoadBits, load)
+		list.UpdateNode(50 * time.Millisecond)
 
-		// Force the gossip library to refresh our node's data immediately
-		list.UpdateNode(100 * time.Millisecond)
-
-		// Check every 2 seconds
-		time.Sleep(2 * time.Second)
+		// Faster refresh gives fresher peer decisions under bursts.
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
 // --- HTTP PROXY LOGIC ---
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
-	LoadLock.RLock()
-	currentLoad := MyCurrentLoad
-	LoadLock.RUnlock()
+	atomic.AddInt64(&LocalInflight, 1)
+	defer atomic.AddInt64(&LocalInflight, -1)
 
-	// THRESHOLD: If CPU > 50%, try to offload
-	if currentLoad > 50.0 {
+	cpuLoad := atomicLoadFloat64(&MyCurrentLoadBits)
+	inflight := atomic.LoadInt64(&LocalInflight)
+	score := localScore(cpuLoad, inflight)
+
+	// Allow at most one offload hop to avoid ping-pong.
+	offloadHops, _ := strconv.Atoi(r.Header.Get("X-Gossip-Offload-Hop"))
+	if offloadHops == 0 && score >= OffloadAt {
 		bestNode := findBestPeer()
 		if bestNode != "" {
-			fmt.Printf("[OFFLOAD] My Load %.0f%% -> Forwarding to %s\n", currentLoad, bestNode)
+			fmt.Printf("[OFFLOAD] CPU %.0f%% score %.1f inflight %d -> %s\n", cpuLoad, score, inflight, bestNode)
+			r.Header.Set("X-Gossip-Offload-Hop", "1")
 			proxyRequest(w, r, bestNode)
 			return
 		}
-		fmt.Println("[WARNING] Overloaded, but no idle peers found!")
 	}
 
-	// Default: Handle locally
-	// fmt.Printf("[LOCAL] Handling Request (Load: %.0f%%)\n", currentLoad)
 	proxyRequest(w, r, TargetURL)
 }
 
 func findBestPeer() string {
 	members := list.Members()
+	var bestAddr string
+	bestScore := math.MaxFloat64
+
 	for _, member := range members {
-		// Skip myself
 		if member.Name == list.LocalNode().Name {
 			continue
 		}
 
-		// Decode their metadata
 		var meta NodeMeta
-		if err := json.Unmarshal(member.Meta, &meta); err == nil {
-			// If they are idle (Load < 50%), send it to them!
-			if meta.CPULoad < 50.0 {
-				return meta.ProxyAddress
-			}
+		if err := json.Unmarshal(member.Meta, &meta); err != nil {
+			continue
+		}
+		if meta.ProxyAddress == "" {
+			continue
+		}
+		if meta.Score < AcceptBelow && meta.Score < bestScore {
+			bestScore = meta.Score
+			bestAddr = meta.ProxyAddress
 		}
 	}
-	return ""
+	return bestAddr
 }
 
 func proxyRequest(w http.ResponseWriter, r *http.Request, target string) {
-	// Construct the forwarding URL
-	finalURL := target + r.URL.Path
-	
-	// Create a new request
-	req, err := http.NewRequest(r.Method, finalURL, r.Body)
+	finalURL := target + r.URL.RequestURI()
+
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, finalURL, r.Body)
 	if err != nil {
-		http.Error(w, "Failed to create request", 500)
+		http.Error(w, "Failed to create request", http.StatusInternalServerError)
 		return
 	}
 
-	// Copy headers (Important for Content-Type)
-	for name, values := range r.Header {
-		for _, value := range values {
-			req.Header.Add(name, value)
-		}
-	}
+	// Clone inbound headers and drop hop-by-hop proxy headers.
+	req.Header = r.Header.Clone()
+	req.Header.Del("Connection")
+	req.Header.Del("Proxy-Connection")
+	req.Header.Del("Keep-Alive")
+	req.Header.Del("Transfer-Encoding")
+	req.Header.Del("TE")
+	req.Header.Del("Trailer")
+	req.Header.Del("Upgrade")
 
-	// Execute the request
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := upstreamClient.Do(req)
 	if err != nil {
-		http.Error(w, "Upstream Error: "+err.Error(), 502)
+		http.Error(w, "Upstream Error: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	// Copy response headers and body back to the user
 	for name, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(name, value)
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+func localScore(cpuLoad float64, inflight int64) float64 {
+	queuePressure := math.Min(100.0, float64(inflight)*100.0/float64(MaxInflight))
+	// CPU is primary, queue pressure helps react faster during spikes.
+	return 0.7*cpuLoad + 0.3*queuePressure
+}
+
+func atomicStoreFloat64(dst *uint64, v float64) {
+	atomic.StoreUint64(dst, math.Float64bits(v))
+}
+
+func atomicLoadFloat64(src *uint64) float64 {
+	return math.Float64frombits(atomic.LoadUint64(src))
 }
