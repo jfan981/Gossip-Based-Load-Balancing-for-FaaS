@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"math/rand"
 	"net/http"
 	"strconv"
 	"sync/atomic"
@@ -192,6 +193,15 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 func findBestPeer() string {
 	members := list.Members()
+
+	// --- Shuffle the members to break ties ---
+	shuffled := make([]*memberlist.Node, len(members))
+	copy(shuffled, members)
+
+	rand.Shuffle(len(shuffled), func(i, j int) {
+		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	})
+
 	var bestAddr string
 	bestScore := math.MaxFloat64
 
