@@ -21,6 +21,7 @@ var (
 	TargetURL   string  // The actual OpenFaaS Node URL (e.g., http://192.168.64.2:8080)
 	ProxyPort   int     // The port this proxy listens on (e.g., 8081)
 	GossipPort  int     // The port used for internal gossip (e.g., 7946)
+	BindAddr    string  // The IP address to bind Gossip to
 	FakeLoad    float64 // For demo: force a specific CPU load
 	OffloadAt   float64 // Offload when score >= this threshold
 	AcceptBelow float64 // Only offload to peers below this score
@@ -57,6 +58,7 @@ type NodeMeta struct {
 func main() {
 	// 1. Parse command-line arguments.
 	flag.StringVar(&TargetURL, "target", "http://localhost:8080", "The real OpenFaaS node URL")
+	flag.StringVar(&BindAddr, "bind", "127.0.0.1", "IP address for Gossip to bind to")
 	flag.IntVar(&ProxyPort, "port", 8081, "HTTP port for this proxy")
 	flag.IntVar(&GossipPort, "gossip", 7946, "Gossip port")
 	flag.Float64Var(&FakeLoad, "fake-load", 0.0, "Force a fake CPU load (0-100)")
@@ -98,6 +100,7 @@ func main() {
 func startGossip(joinAddr string) {
 	config := memberlist.DefaultLANConfig()
 	config.BindPort = GossipPort
+	config.BindAddr = BindAddr
 	config.Name = fmt.Sprintf("Node-Port-%d", ProxyPort)
 	config.Delegate = &GossipDelegate{}
 
