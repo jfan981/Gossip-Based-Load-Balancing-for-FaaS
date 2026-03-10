@@ -7,9 +7,9 @@ import (
 	"io"
 	"log"
 	"math"
-	"math/rand"
 	"net/http"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,6 +31,9 @@ var (
 	// State (atomics to avoid lock contention on hot path).
 	MyCurrentLoadBits uint64
 	LocalInflight     int64
+
+	// Predictive scoring tracker
+	peerInflight sync.Map // Safely tracks offloaded requests per peer
 
 	// Gossip cluster.
 	list *memberlist.Memberlist
@@ -54,6 +57,17 @@ type NodeMeta struct {
 	CPULoad      float64 `json:"cpu"`  // CPU usage
 	Inflight     int64   `json:"if"`   // Number of in-flight requests
 	Score        float64 `json:"score"`
+}
+
+// Safely gets or creates an atomic counter for a specific peer
+func getPeerCounter(addr string) *int64 {
+	val, ok := peerInflight.Load(addr)
+	if !ok {
+		newCounter := new(int64)
+		val, _ = peerInflight.LoadOrStore(addr, newCounter)
+		return val.(*int64)
+	}
+	return val.(*int64)
 }
 
 func main() {
@@ -103,6 +117,7 @@ func startGossip(joinAddr string) {
 	config.BindPort = GossipPort
 	config.BindAddr = BindAddr
 	config.Name = fmt.Sprintf("Node-Port-%d", ProxyPort)
+	config.LogOutput = io.Discard
 	config.Delegate = &GossipDelegate{}
 
 	var err error
@@ -183,6 +198,12 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		if bestNode != "" {
 			fmt.Printf("[OFFLOAD] CPU %.0f%% score %.1f inflight %d -> %s\n", cpuLoad, score, inflight, bestNode)
 			r.Header.Set("X-Gossip-Offload-Hop", "1")
+
+			// Increment predictive penalty counter
+			pCounter := getPeerCounter(bestNode)
+			atomic.AddInt64(pCounter, 1)
+			defer atomic.AddInt64(pCounter, -1)
+
 			proxyRequest(w, r, bestNode)
 			return
 		}
@@ -193,15 +214,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 func findBestPeer() string {
 	members := list.Members()
-
-	// --- Shuffle the members to break ties ---
-	shuffled := make([]*memberlist.Node, len(members))
-	copy(shuffled, members)
-
-	rand.Shuffle(len(shuffled), func(i, j int) {
-		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
-	})
-
 	var bestAddr string
 	bestScore := math.MaxFloat64
 
@@ -217,8 +229,13 @@ func findBestPeer() string {
 		if meta.ProxyAddress == "" {
 			continue
 		}
-		if meta.Score < AcceptBelow && meta.Score < bestScore {
-			bestScore = meta.Score
+
+		// Apply the Predictive Penalty (+15 per inflight request)
+		pendingRequests := atomic.LoadInt64(getPeerCounter(meta.ProxyAddress))
+		predictedScore := meta.Score + (float64(pendingRequests) * 15.0)
+
+		if predictedScore < AcceptBelow && predictedScore < bestScore {
+			bestScore = predictedScore
 			bestAddr = meta.ProxyAddress
 		}
 	}
