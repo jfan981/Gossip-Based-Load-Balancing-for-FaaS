@@ -7,7 +7,14 @@ functions:
     lang: python3-http
     handler: ./stress-test
     image: jfan981/stress-test:v5-final
-    labels:
-      com.openfaas.scale.min: 5
-      com.openfaas.scale.max: 5
+    
+    # Prevents OpenFaaS from timing out during heavy stress tests
+    environment:
+      read_timeout: 60s
+      write_timeout: 60s
+      exec_timeout: 60s
 
+    labels:
+      # Lock replicas to the number of physical CPU cores (2 vCPUs)
+      com.openfaas.scale.min: 2
+      com.openfaas.scale.max: 2
